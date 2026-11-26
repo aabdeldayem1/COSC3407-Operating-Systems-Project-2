@@ -22,12 +22,44 @@ public class UserProcess {
     /**
      * Allocate a new process.
      */
+
+	private static final int MAX_FILES = 16;
+	private static final int MAX_FILENAME_LENGTH = 256;
+
+	protected OpenFile[] fileTable;
+	protected boolean isRoot = false;
+	private static boolean rootCreated = false;
+
+
     public UserProcess() {
-	int numPhysPages = Machine.processor().getNumPhysPages();
-	pageTable = new TranslationEntry[numPhysPages];
-	for (int i=0; i<numPhysPages; i++)
-	    pageTable[i] = new TranslationEntry(i,i, true,false,false,false);
-    }
+		int numPhysPages = Machine.processor().getNumPhysPages();
+		pageTable = new TranslationEntry[numPhysPages];
+		for (int i=0; i<numPhysPages; i++)
+	 	   pageTable[i] = new TranslationEntry(i,i, true,false,false,false);
+
+		if(!rootCreated){
+			isRoot = true;
+			rootCreated = true;
+		}
+
+		//initialize file descriptors
+		fileTable = new OpenFile[MAX_FILES];
+		fileTable[0] = UserKernel.console.openForReading();
+		fileTable[1] = UserKernel.console.openForWriting();
+	}
+
+	private int findFreeDescriptor(){
+		for(int i=0; i<fileTable.length; i++){
+			if(fileTable[i] == null){
+				return i;
+			}
+		}
+		return -1;
+	}
+
+	private boolean isValidDescriptor(int fd){
+		return fd >= 0 && fd < fileTable.length && fileTable[fd] != null;
+	}
     
     /**
      * Allocate and return a new process of the correct class. The class name
@@ -36,6 +68,8 @@ public class UserProcess {
      *
      * @return	a new process of the correct class.
      */
+
+
     public static UserProcess newUserProcess() {
 	return (UserProcess)Lib.constructObject(Machine.getProcessClassName());
     }
@@ -340,11 +374,95 @@ public class UserProcess {
      */
     private int handleHalt() {
 
-	Machine.halt();
-	
-	Lib.assertNotReached("Machine.halt() did not halt machine!");
-	return 0;
+		if(!isRoot){
+			return 0;
+		}
+
+		Machine.halt();
+		Lib.assertNotReached("Machine.halt() did not halt machine!");
+		return 0;
     }
+
+	private int handleCreat(int nameVaddr){
+		if(nameVaddr < 0) return -1;
+
+		String filename = readVirtualMemoryString(nameVaddr, MAX_FILENAME_LENGTH);
+		if(filename == null || filename.length() ==0) return -1;
+
+		int fd = findFreeDescriptor();
+		if (fd == -1) return -1;
+
+		OpenFile file = ThreadedKernel.fileSystem.open(filename, true);
+		if(file == null) return -1;
+
+		fileTable[fd] = file;
+		return fd;
+	}
+
+	private int handleOpen(int nameVaddr){
+		if(nameVaddr < 0) return -1;
+
+		String filename = readVirtualMemoryString(nameVaddr, MAX_FILENAME_LENGTH);
+		if(filename == null || filename.length() ==0) return -1;
+		int fd = findFreeDescriptor();
+		if (fd == -1) return -1;
+
+		OpenFile file = ThreadedKernel.fileSystem.open(filename, false);
+		if(file == null) return -1;
+		fileTable[fd] = file;
+		return fd;
+	}
+
+	private int handleRead(int fd, int bufferVaddr, int couny){
+		if(!isValidDescriptor(fd) || bufferVaddr < 0 || couny < 0) return -1;
+		if(couny == 0) return 0;
+
+		OpenFile file = fileTable[fd];
+		byte[] kernelBuffer = new byte[pageSize];
+		int totalTransferred = 0;
+
+		while(totalTransferred < couny){
+			int chunk = Math.min(pageSize, couny - totalTransferred);
+			int bytesRead = file.read(kernelBuffer, 0, chunk);
+
+			if(bytesRead == -1) return -1;
+			if(bytesRead == 0) break;
+
+			int bytesWritten = writeVirtualMemory(bufferVaddr + totalTransferred, kernelBuffer, 0, bytesRead);
+
+			if(bytesWritten < bytesRead) return -1;
+
+			totalTransferred += bytesRead;
+
+			if(bytesRead < chunk) break;
+		}
+
+		return totalTransferred;
+	}
+	/*
+	COMPLETE THIS
+	 */
+
+	private int handleWrite(int fd, int bufferVaddr, int couny){
+		return 0;
+	}
+
+	private int handleClose(int fd){
+		if(!isValidDescriptor(fd)) return -1;
+
+		fileTable[fd].close();
+		fileTable[fd] = null;
+		return 0;
+	}
+
+	private int handleUnlink(int nameVaddr){
+		if(nameVaddr < 0) return -1;
+
+		String filename = readVirtualMemoryString(nameVaddr, MAX_FILENAME_LENGTH);
+		if(filename == null || filename.length() ==0) return -1;
+
+		return ThreadedKernel.fileSystem.remove(filename) ? 0 : -1;
+	}
 
 
     private static final int
@@ -388,16 +506,28 @@ public class UserProcess {
      * @return	the value to be returned to the user.
      */
     public int handleSyscall(int syscall, int a0, int a1, int a2, int a3) {
-	switch (syscall) {
-	case syscallHalt:
-	    return handleHalt();
+		switch (syscall) {
+			case syscallHalt:
+	    		return handleHalt();
+			case syscallCreate:
+				return handleCreat(a0);
+			case syscallOpen:
+				return handleOpen(a0);
+			case syscallRead:
+				return handleRead(a0, a1, a2);
+			case syscallWrite:
+				return handleWrite(a0, a1, a2);
+			case syscallClose:
+				return handleClose(a0);
+			case syscallUnlink:
+				return handleUnlink(a0);
 
+			default:
+	    		Lib.debug(dbgProcess, "Unknown syscall " + syscall);
+	    		Lib.assertNotReached("Unknown system call!");
+		}
 
-	default:
-	    Lib.debug(dbgProcess, "Unknown syscall " + syscall);
-	    Lib.assertNotReached("Unknown system call!");
-	}
-	return 0;
+		return 0;
     }
 
     /**
