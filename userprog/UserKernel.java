@@ -3,6 +3,9 @@ package nachos.userprog;
 import nachos.machine.*;
 import nachos.threads.*;
 import nachos.userprog.*;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A kernel that can support multiple user processes.
@@ -11,6 +14,11 @@ public class UserKernel extends ThreadedKernel {
     /**
      * Allocate a new user kernel.
      */
+	private static HashMap<String, GlobalFileEntry> globalFiles;
+	private static Lock fileTableLock;
+
+	private static LinkedList<Integer> freePages;
+	private static Lock memLock;
     public UserKernel() {
 	super();
     }
@@ -21,6 +29,18 @@ public class UserKernel extends ThreadedKernel {
      */
     public void initialize(String[] args) {
 	super.initialize(args);
+
+	globalFiles = new HashMap<String, GlobalFileEntry>();
+	fileTableLock = new Lock();
+
+	freePages = new LinkedList<Integer>();
+	memLock = new Lock();
+
+
+	int numPhysPages = Machine.processor().getNumPhysPages();
+	for(int i = 0; i < numPhysPages; i++) {
+		freePages.add(i);
+	}
 
 	console = new SynchConsole(Machine.console());
 	
@@ -112,4 +132,103 @@ public class UserKernel extends ThreadedKernel {
 
     // dummy variables to make javac smarter
     private static Coff dummy1 = null;
+
+	private static class GlobalFileEntry{
+		int openCount = 0;
+		boolean pendingUnlink = false;
+	}
+
+	public static OpenFile openFile(String filename, boolean create) {
+		fileTableLock.acquire();
+
+		try{
+			GlobalFileEntry entry = globalFiles.get(filename);
+
+			if(entry != null && entry.pendingUnlink){
+				return null;
+			}
+
+			OpenFile file = ThreadedKernel.fileSystem.open(filename, create);
+			if(file == null){
+				return null;
+			}
+
+			if(entry == null){
+				entry = new GlobalFileEntry();
+				globalFiles.put(filename, entry);
+			}
+			entry.openCount++;
+			return file;
+		} finally{
+			fileTableLock.release();
+		}
+	}
+
+	public static void closeFile(OpenFile file) {
+		if(file == null) return;
+
+		String filename = file.getName();
+		file.close();
+
+		if(filename == null) return;
+		fileTableLock.acquire();
+
+		try{
+			GlobalFileEntry entry = globalFiles.get(filename);
+			if(entry != null){
+				entry.openCount--;
+				if(entry.openCount <= 0){
+					globalFiles.remove(filename);
+					if(entry.pendingUnlink){
+						ThreadedKernel.fileSystem.remove(filename);
+					}
+				}
+			}
+		} finally{
+			fileTableLock.release();
+		}
+	}
+
+	public static boolean unlinkFile(String filename) {
+		fileTableLock.acquire();
+		try {
+			GlobalFileEntry entry = globalFiles.get(filename);
+			if(entry != null){
+				if(entry.pendingUnlink){
+					return false;
+				}
+				entry.pendingUnlink = true;
+				return true;
+			}
+			return ThreadedKernel.fileSystem.remove(filename);
+		} finally {
+			fileTableLock.release();
+		}
+	}
+
+	public static int allocatePages(){
+		memLock.acquire();
+
+		try{
+			if(freePages.isEmpty()){
+				return -1;
+			}
+			return freePages.removeFirst();
+		} finally{
+			memLock.release();
+		}
+	}
+
+
+	public static void freePages(int ppn){
+		if (ppn < 0 || ppn >= Machine.processor().getNumPhysPages()){
+			return;
+		}
+		memLock.acquire();
+		try{
+			freePages.add(ppn);
+		} finally {
+			memLock.release();
+		}
+	}
 }
